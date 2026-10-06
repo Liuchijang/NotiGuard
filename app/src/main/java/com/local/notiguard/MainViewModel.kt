@@ -3,7 +3,11 @@ package com.local.notiguard
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.os.PowerManager
+import android.provider.Settings
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -19,6 +23,7 @@ import com.local.notiguard.data.Step
 import com.local.notiguard.data.Tweak
 import com.local.notiguard.data.TweakCatalog
 import com.local.notiguard.data.TweakStatus
+import com.local.notiguard.data.expectMatches
 import com.local.notiguard.fcmcore.FcmList
 import com.local.notiguard.fcmguard.AutostartStatusReader
 import com.local.notiguard.fcmguard.FcmAppScanner
@@ -36,7 +41,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     val shizukuState = ShizukuManager.state
 
-    // --- Per-app push ---
+    // --- Installed apps / app-check list ---
     var installedApps by mutableStateOf<List<InstalledApp>>(emptyList())
         private set
     var appsLoading by mutableStateOf(true)
@@ -44,13 +49,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var selected by mutableStateOf<Set<String>>(emptySet())
         private set
 
-    /** Packages currently in the Doze whitelist (smart "already optimized" hint). */
-    var whitelisted by mutableStateOf<Set<String>>(emptySet())
-        private set
-
     // --- Per-app health check ---
-    var checkPkgs by mutableStateOf<Set<String>>(emptySet())
-        private set
+    /** Apps picked for the app check (stored under the old per-app push key, so picks survive). */
+    val checkPkgs: Set<String> get() = selected
 
     /** pkg → (check id → result). Absent = not checked yet. */
     var checkResults by mutableStateOf<Map<String, Map<String, CheckResult>>>(emptyMap())
@@ -101,19 +102,31 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         private set
     val fcmHasGms get() = FcmList.hasGms(fcmValue)
 
+    // Declared before init: init → refreshFcm() reads it.
+    /** Entries that are also in the Doze whitelist (= "No restrictions" in HyperOS Settings). */
+    var milletDoze by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    private val labelCache = HashMap<String, String>()
+
+
     /** Scanned FCM clients with their read-only Autostart state; null = not scanned yet. */
     var fcmApps by mutableStateOf<List<Pair<FcmAppScanner.AppEntry, AutostartStatusReader.Status>>?>(null)
         private set
     var fcmScanning by mutableStateOf(false)
         private set
 
-    /** Per-app push setup is ON when every picked app is in the Doze whitelist. */
-    val perAppStatus: TweakStatus
-        get() = when {
-            selected.isEmpty() || shizukuState.value != ShizukuManager.State.READY -> TweakStatus.UNKNOWN
-            selected.all { it in whitelisted } -> TweakStatus.APPLIED
-            else -> TweakStatus.NOT_APPLIED
-        }
+    /** Set while the user is on our notification settings page; checked in [onResume]. */
+    private var notifSettingsPending = false
+
+    // --- Permissions (first-run setup screen + warnings) ---
+    var showSetup by mutableStateOf(!Permissions.setupDone(app))
+        private set
+    var notifEnabled by mutableStateOf(Permissions.notificationsEnabled(app))
+        private set
+    /** Notifications allowed from Settings, so FCM Guard can show its persistent notification. */
+    var notifReady by mutableStateOf(false)
+        private set
 
     val log: SnapshotStateList<LogLine> = emptyList<LogLine>().toMutableStateList()
 
@@ -121,14 +134,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         selected = prefs.getStringSet(KEY_SELECTED, emptySet()).orEmpty().toSet()
-        checkPkgs = prefs.getStringSet(KEY_CHECK, emptySet()).orEmpty().toSet()
+        prefs.edit().remove(KEY_CHECK).apply() // old separate app-check list, now shared with per-app push
         loadApps()
         refreshFcm()
         // Auto-probe status whenever Shizuku becomes ready.
         viewModelScope.launch {
             ShizukuManager.state.collect { st ->
                 testShizuku()
-                if (st == ShizukuManager.State.READY && !running) checkStatus()
+                // Re-read on every change: READY → full shell read; lost → the Settings-readable part.
+                if (!running) checkStatus()
             }
         }
     }
@@ -188,14 +202,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun toggleSelected(pkg: String) {
         selected = if (pkg in selected) selected - pkg else selected + pkg
+        if (pkg !in selected) checkResults = checkResults - pkg
         prefs.edit().putStringSet(KEY_SELECTED, selected).apply()
     }
 
-    fun toggleCheckPkg(pkg: String) {
-        checkPkgs = if (pkg in checkPkgs) checkPkgs - pkg else checkPkgs + pkg
-        if (pkg !in checkPkgs) checkResults = checkResults - pkg
-        prefs.edit().putStringSet(KEY_CHECK, checkPkgs).apply()
-    }
 
     fun toggleBloat(pkg: String) {
         bloatSelected = if (pkg in bloatSelected) bloatSelected - pkg else bloatSelected + pkg
@@ -207,52 +217,65 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- Smart status probing ----------
 
-    /** Public, guarded: re-read the device state for every system tweak + Doze whitelist. */
+    /** Public, guarded: re-read the device state for every system tweak. */
     fun checkStatus() {
         if (running || statusChecking) return
         viewModelScope.launch {
             statusChecking = true
             try {
                 probeSystemStatus()
-                probeWhitelist()
             } finally {
                 statusChecking = false
             }
         }
     }
 
+    private val shizukuReady get() = ShizukuManager.state.value == ShizukuManager.State.READY
+
+    /** Without Shizuku only the steps verified by a plain `settings get` can be read (see [readSettingLocal]). */
     private suspend fun probeSystemStatus() {
-        if (ShizukuManager.state.value != ShizukuManager.State.READY) {
-            systemStatus = TweakCatalog.system.associate { it.id to TweakStatus.UNKNOWN }
-            return
-        }
-        val result = LinkedHashMap<String, TweakStatus>()
-        for (tw in TweakCatalog.system) {
-            var known = false
-            var applied = true
-            for (st in tw.steps) {
-                val v = st.verify ?: continue
-                val e = st.expect ?: continue
-                known = true
-                val r = ShizukuManager.exec(v)
-                if (!(r.ok && r.output.trim().contains(e))) applied = false
-            }
-            result[tw.id] = when {
-                !known -> TweakStatus.UNKNOWN
-                applied -> TweakStatus.APPLIED
-                else -> TweakStatus.NOT_APPLIED
-            }
-        }
-        systemStatus = result
+        val read: suspend (String) -> String? = if (shizukuReady) { c -> readShell(c) } else { c -> readSettingLocal(c) }
+        systemStatus = TweakCatalog.system.associate { it.id to readStatus(it.steps, read) }
     }
 
-    private suspend fun probeWhitelist() {
-        if (ShizukuManager.state.value != ShizukuManager.State.READY) return
-        val r = ShizukuManager.exec("dumpsys deviceidle whitelist")
-        if (!r.ok) return
-        val out = r.output
-        whitelisted = installedApps.map { it.pkg }.filter { out.contains(it) }.toSet() +
-            selected.filter { out.contains(it) }.toSet()
+    /** Output of [cmd] through Shizuku, or null when it could not run. */
+    private suspend fun readShell(cmd: String): String? = ShizukuManager.exec(cmd).takeIf { it.ok }?.output
+
+    /**
+     * `settings get <global|secure|system> <key>` answered through the Settings provider, which any
+     * app may read (this one targets SDK 22, so hidden keys are readable too). Unset prints "null"
+     * like the shell does. Any other command (dumpsys, appops…) is unreadable without Shizuku → null.
+     */
+    private fun readSettingLocal(cmd: String): String? {
+        val m = Regex("""^settings get (global|secure|system) (\S+)$""").find(cmd.trim()) ?: return null
+        val (ns, key) = m.destructured
+        val cr = getApplication<Application>().contentResolver
+        return runCatching {
+            when (ns) {
+                "global" -> Settings.Global.getString(cr, key)
+                "secure" -> Settings.Secure.getString(cr, key)
+                else -> Settings.System.getString(cr, key)
+            } ?: "null"
+        }.getOrNull()
+    }
+
+    /**
+     * APPLIED = every verify read back its expected value; NOT_APPLIED = at least one read a different
+     * value; UNKNOWN = nothing to verify, or a read failed (Shizuku/command error) and nothing mismatched.
+     * A failed read is never shown as OFF.
+     */
+    private suspend fun readStatus(steps: List<Step>, read: suspend (String) -> String? = ::readShell): TweakStatus {
+        var checked = 0
+        var unreadable = false
+        for (st in steps) {
+            val v = st.verify ?: continue
+            if (st.expect == null) continue
+            val out = read(v)
+            if (out == null) { unreadable = true; continue }
+            checked++
+            if (!st.matches(out)) return TweakStatus.NOT_APPLIED
+        }
+        return if (checked == 0 || unreadable) TweakStatus.UNKNOWN else TweakStatus.APPLIED
     }
 
     // ---------- Setups (on/off) ----------
@@ -280,27 +303,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         probeSystemStatus()
     }
 
-    fun setPerApp(on: Boolean) = launchRun {
-        val pkgs = selected.toList()
-        if (pkgs.isEmpty()) { appendHeading(tr("⚠ Chưa chọn app nào", "⚠ No app selected")); return@launchRun }
-        if (on) {
-            var ok = 0; var tot = 0
-            pkgs.forEach { pkg ->
-                appendHeading(tr("▶ BẬT đẩy thông báo: ", "▶ ON push: ") + "${labelFor(pkg)} ($pkg)")
-                TweakCatalog.stepsFor(pkg).forEach { tot++; if (runStep(it)) ok++ }
-            }
-            appendSummary(ok, tot)
-        } else {
-            pkgs.forEach { pkg ->
-                appendHeading(tr("▶ TẮT đẩy thông báo: ", "▶ OFF push: ") + "${labelFor(pkg)} ($pkg)")
-                runRevert(TweakCatalog.revertFor(pkg))
-            }
-        }
-        probeWhitelist()
-        // Keep health-check cards in sync for apps that were already checked.
-        pkgs.filter { it in checkResults }.forEach { checkResults = checkResults + (it to probeApp(it)) }
-    }
-
     private suspend fun runRevert(commands: List<String>) {
         var ok = 0
         commands.forEach { cmd ->
@@ -316,12 +318,37 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refreshFcm() {
         val ctx = getApplication<Application>()
+        notifEnabled = Permissions.notificationsEnabled(ctx)
+        notifReady = FcmGuardService.notificationsReady(ctx)
         fcmValue = FcmGuard.read(ctx)
         fcmChecked = true
+        refreshMilletDoze()
         fcmCanWrite = FcmGuard.canWrite(ctx)
         fcmNotifBlocked = fcmGuardOn && fcmPersistent && !FcmGuardService.canShowNotification(ctx)
         // Re-arm the watcher in case HyperOS killed it while we were away.
         if (fcmGuardOn) FcmGuardService.start(ctx)
+    }
+
+    // ---------- HyperOS no-restrict list (MILLET_NO_RESTRICT_APP), edited by the user ----------
+
+    val milletPkgs: Set<String> get() = FcmList.parse(fcmValue)
+
+    private fun refreshMilletDoze() {
+        val power = getApplication<Application>().getSystemService(Context.POWER_SERVICE) as PowerManager
+        milletDoze = milletPkgs.filter { runCatching { power.isIgnoringBatteryOptimizations(it) }.getOrDefault(false) }.toSet()
+    }
+
+    /** Picker toggle: checked → add to the list, unchecked → remove. Each change is written at once. */
+    fun toggleMillet(pkg: String) {
+        val add = pkg !in milletPkgs
+        viewModelScope.launch {
+            val ctx = getApplication<Application>()
+            val r = if (add) FcmGuard.add(ctx, pkg) else FcmGuard.remove(ctx, pkg)
+            fcmValue = r.value
+            refreshMilletDoze()
+            val verb = if (add) tr("+ Thêm ", "+ Add ") else tr("− Bỏ ", "− Remove ")
+            log.add(LogLine("  ${if (r.ok) "✓" else "✗"} $verb${labelFor(pkg)} → ${FcmList.KEY}: ${r.message}", r.ok))
+        }
     }
 
     fun repairFcm() = launchRun {
@@ -372,9 +399,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (!AppSettings.openWriteSettings(getApplication())) appendHeading(tr("⚠ Không mở được trang Sửa cài đặt hệ thống", "⚠ Could not open Modify system settings"))
     }
 
+    /** Notifications are turned on from Settings, never the in-app system prompt (see [Permissions]). */
     fun openNotificationSettings() {
         val ctx = getApplication<Application>()
-        AppSettings.open(ctx, "notif", ctx.packageName, "NotiGuard")
+        if (AppSettings.open(ctx, "notif", ctx.packageName, "NotiGuard")) notifSettingsPending = true
+    }
+
+
+    fun finishSetup() {
+        Permissions.markSetupDone(getApplication())
+        showSetup = false
     }
 
     fun scanFcmApps() {
@@ -401,12 +435,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val pkgs = sortedCheckPkgs()
         if (pkgs.isEmpty()) { appendHeading(tr("⚠ Chưa chọn app nào để kiểm tra", "⚠ No app selected to check")); return@launchRun }
         appendHeading(tr("▶ Kiểm tra ${pkgs.size} app", "▶ Checking ${pkgs.size} apps"))
+        if (ShizukuManager.state.value != ShizukuManager.State.READY) {
+            log.add(LogLine(tr("  (không có Shizuku: bỏ qua standby bucket, data nền)", "  (no Shizuku: standby bucket and background data skipped)")))
+        }
         var good = 0
         pkgs.forEach { pkg ->
             val res = probeApp(pkg)
             checkResults = checkResults + (pkg to res)
-            val ok = res.values.count { it.state == CheckState.OK }
-            val fail = res.values.count { it.state == CheckState.FAIL }
+            val scored = res.filterKeys { it in TweakCatalog.scoredChecks }.values
+            val ok = scored.count { it.state == CheckState.OK }
+            val fail = scored.count { it.state == CheckState.FAIL }
             if (fail == 0) good++
             log.add(LogLine("  ${labelFor(pkg)}: $ok/${ok + fail} " + tr("mục đã bật", "items on"), fail == 0))
         }
@@ -418,6 +456,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun fixAllChecked() = launchRun { fixAndRecheck(sortedCheckPkgs().filter { fixableFor(it).isNotEmpty() }) }
 
     private suspend fun fixAndRecheck(pkgs: List<String>) {
+        if (ShizukuManager.state.value != ShizukuManager.State.READY) {
+            appendHeading(tr("⚠ Sửa cần Shizuku đang chạy", "⚠ Fixing needs Shizuku running")); return
+        }
         var ok = 0; var tot = 0
         pkgs.forEach { pkg ->
             appendHeading(tr("▶ Sửa ", "▶ Fix ") + "${labelFor(pkg)} ($pkg)")
@@ -453,22 +494,42 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun onResume() {
-        refreshFcm()
+        // Settings may have changed outside the app (system Settings, adb, Doze back on after reboot):
+        // re-read so every switch matches the device.
+        if (!running) checkStatus()
+        if (notifSettingsPending) {
+            notifSettingsPending = false
+            Permissions.confirmNotificationsFromSettings(getApplication())
+        }
+        refreshFcm() // restarts the guard, which now goes foreground if notifications are ready
         // Back from HyperOS settings → re-read Autostart for an already shown scan (like FCMGuard).
         if (fcmApps != null) scanFcmApps()
         val pkg = pendingRecheck ?: return
-        if (running || ShizukuManager.state.value != ShizukuManager.State.READY) return
+        if (running) return
         pendingRecheck = null
         viewModelScope.launch { checkResults = checkResults + (pkg to probeApp(pkg)) }
     }
 
+    /** Shell probe through Shizuku when ready; otherwise the read-only public-API subset. */
     private suspend fun probeApp(pkg: String): Map<String, CheckResult> {
-        val r = ShizukuManager.exec(TweakCatalog.appCheckScript(pkg))
-        return TweakCatalog.parseAppCheck(r.output)
+        val ctx = getApplication<Application>()
+        val local = withContext(Dispatchers.IO) { LocalAppProbe.probe(ctx, pkg) }
+        if (ShizukuManager.state.value != ShizukuManager.State.READY) return local
+        val shell = TweakCatalog.parseAppCheck(ShizukuManager.exec(TweakCatalog.appCheckScript(pkg)).output)
+        // Debug builds: report where the no-Shizuku path disagrees with the shell probe.
+        if (ctx.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            shell.forEach { (id, s) ->
+                val l = local[id] ?: return@forEach
+                if (l.state != CheckState.NA && s.state != CheckState.NA && l.state != s.state) {
+                    Log.w("NotiGuard", "app check mismatch $pkg/$id: shell=${s.state} local=${l.state} ${l.detail}")
+                }
+            }
+        }
+        return shell
     }
 
     private fun fixableFor(pkg: String) = TweakCatalog.appChecks.filter {
-        it.fix != null && checkResults[pkg]?.get(it.id)?.state == CheckState.FAIL
+        !it.optional && it.fix != null && checkResults[pkg]?.get(it.id)?.state == CheckState.FAIL
     }
 
     private fun sortedCheckPkgs() = checkPkgs.sortedBy { labelFor(it).lowercase() }
@@ -502,7 +563,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         bloatSelected = bloatSelected.intersect(bloat.map { it.pkg }.toSet())
     }
 
-    fun labelFor(pkg: String) = installedApps.firstOrNull { it.pkg == pkg }?.label ?: pkg
+    /** Launcher apps from the loaded list; other packages (services, list entries) via PackageManager, cached. */
+    fun labelFor(pkg: String) = installedApps.firstOrNull { it.pkg == pkg }?.label ?: labelCache.getOrPut(pkg) {
+        val pm = getApplication<Application>().packageManager
+        runCatching { pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString() }.getOrDefault(pkg)
+    }
     private fun bloatLabelFor(pkg: String) =
         TweakCatalog.bloatware.firstOrNull { it.pkg == pkg }?.label?.text ?: pkg
 
@@ -536,7 +601,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val verifyRes = ShizukuManager.exec(step.verify)
         val got = verifyRes.output.trim().replace("\n", " ")
             .let { if (it.length > 60) it.take(57) + "…" else it }
-        val ok = verifyRes.output.trim().contains(step.expect)
+        val ok = step.matches(verifyRes.output)
         log.add(
             LogLine(
                 if (ok) "  ✓ $short → $got"

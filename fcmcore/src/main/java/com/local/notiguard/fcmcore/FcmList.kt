@@ -41,6 +41,24 @@ object FcmList {
         return pkgs.joinToString(",")
     }
 
+    /**
+     * List with [pkg] appended (order kept), or null when it is already listed. An emptied list
+     * is rebuilt from [lastGood] first, so adding one app never drops the ROM's own entries.
+     */
+    fun withAdded(current: String?, lastGood: String?, pkg: String): String? {
+        val pkgs = parse(current).ifEmpty { parse(lastGood) }
+        if (!pkgs.add(pkg) && parse(current).isNotEmpty()) return null
+        return pkgs.joinToString(",")
+    }
+
+    /** List without [pkg], or null when it is not listed. GMS is never removed: FCM Guard owns it. */
+    fun withRemoved(current: String?, pkg: String): String? {
+        if (pkg == GMS) return null
+        val pkgs = parse(current)
+        if (!pkgs.remove(pkg)) return null
+        return pkgs.joinToString(",")
+    }
+
     /** Single-quote for `sh -c`; vendor entries are kept verbatim, never filtered. */
     fun shellQuote(s: String) = "'" + s.replace("'", "'\\''") + "'"
 

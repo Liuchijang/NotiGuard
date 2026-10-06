@@ -34,6 +34,23 @@ class FcmListTest {
         assertEquals("a.b,c.d,com.google.android.gms", FcmList.merged(" a.b,,a.b, c.d ", null))
     }
 
+    @Test fun addAppendsOnceKeepingOrder() {
+        assertEquals("a.b,com.google.android.gms,x.y", FcmList.withAdded("a.b,com.google.android.gms", null, "x.y"))
+        assertNull(FcmList.withAdded("a.b,x.y", null, "x.y"))
+    }
+
+    @Test fun addToEmptiedListRebuildsFromLastGood() {
+        assertEquals("a.b,c.d,x.y", FcmList.withAdded("", "a.b,c.d", "x.y"))
+        assertEquals("a.b,c.d", FcmList.withAdded(null, "a.b,c.d", "c.d"))
+    }
+
+    @Test fun removeKeepsOthersAndNeverGms() {
+        assertEquals("a.b,com.google.android.gms", FcmList.withRemoved("a.b,x.y,com.google.android.gms", "x.y"))
+        assertNull(FcmList.withRemoved("a.b,com.google.android.gms", "com.google.android.gms"))
+        assertNull(FcmList.withRemoved("a.b", "x.y"))
+        assertNull(FcmList.withRemoved("a.b.c", "a.b"))
+    }
+
     @Test fun shellQuoteNeutralisesQuotes() {
         assertEquals("'a.b'", FcmList.shellQuote("a.b"))
         assertEquals("'x'\\''y'", FcmList.shellQuote("x'y"))

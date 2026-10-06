@@ -23,25 +23,17 @@ object TweakCatalog {
             title = Txt("Tắt App Freezer", "Disable App Freezer"),
             desc = Txt("Không đóng băng app nền — nguyên nhân chính khiến thông báo về chậm.", "Stop freezing background apps, the main cause of late notifications."),
             battery = BatteryImpact.HIGH,
+            // Only the global setting: ActivityManager observes it live and it overrides the
+            // device_config default (verified on HyperOS 3 / Android 16: "use_freezer=false" in
+            // `dumpsys activity`). The old device_config steps are rejected for the shell uid on
+            // Android 16 ("must add flag to the allowlist"), so the switch could never read ON.
             steps = listOf(
                 Step(
                     "settings put global cached_apps_freezer disabled",
                     "settings get global cached_apps_freezer", "disabled",
                 ),
-                Step(
-                    "device_config put activity_manager use_freezer false",
-                    "device_config get activity_manager use_freezer", "false",
-                ),
-                Step(
-                    "device_config put activity_manager default_apps_inactive false",
-                    "device_config get activity_manager default_apps_inactive", "false",
-                ),
             ),
-            revert = listOf(
-                "settings delete global cached_apps_freezer",
-                "device_config delete activity_manager use_freezer",
-                "device_config delete activity_manager default_apps_inactive",
-            ),
+            revert = listOf("settings delete global cached_apps_freezer"),
         ),
         Tweak(
             id = "kill_adaptive_battery",
@@ -84,11 +76,11 @@ object TweakCatalog {
             steps = listOf(
                 Step(
                     "cmd appops set com.google.android.gms WAKE_LOCK allow",
-                    "cmd appops get com.google.android.gms WAKE_LOCK", "allow",
+                    explicitAllow("com.google.android.gms", "WAKE_LOCK"), "OK",
                 ),
                 Step(
                     "cmd appops set com.android.phone WAKE_LOCK allow",
-                    "cmd appops get com.android.phone WAKE_LOCK", "allow",
+                    explicitAllow("com.android.phone", "WAKE_LOCK"), "OK",
                 ),
             ),
             revert = listOf(
@@ -130,65 +122,19 @@ object TweakCatalog {
     )
 
     /**
-     * Per-app setup — applied to each app the user picks. "%s" = package name.
-     * Order matters: whitelist first, then bucket, then appops, then background-data.
-     * Each step reads its state back to confirm it stuck.
+     * Prints OK when [op] is *explicitly* set to allow for [pkg]. For ops whose default mode is
+     * already "allow" (WAKE_LOCK…), `appops get` shows "allow" after a revert to default too, so the
+     * switch would never read OFF. `query-op` lists only explicitly set packages (Android 9+);
+     * older ROMs without it fall back to `appops get`.
      */
-    val perApp: Tweak = Tweak(
-        id = "per_app_push",
-        title = Txt("Mở khóa đẩy thông báo", "Unblock push notifications"),
-        desc = Txt("Doze whitelist, standby active, cho chạy nền + wakelock, mở data nền cho app đã chọn.", "Doze whitelist, active standby, background run + wakelock, background data for picked apps."),
-        battery = BatteryImpact.MEDIUM,
-        perApp = true,
-        steps = listOf(
-            Step(
-                "dumpsys deviceidle whitelist +%s",
-                "dumpsys deviceidle whitelist", "%s",
-            ),
-            Step(
-                "am set-standby-bucket %s active",
-                "am get-standby-bucket %s", "10", // active = 10
-            ),
-            Step(
-                "cmd appops set %s RUN_ANY_IN_BACKGROUND allow",
-                "cmd appops get %s RUN_ANY_IN_BACKGROUND", "allow",
-            ),
-            Step(
-                "cmd appops set %s RUN_IN_BACKGROUND allow",
-                "cmd appops get %s RUN_IN_BACKGROUND", "allow",
-            ),
-            Step(
-                "cmd appops set %s WAKE_LOCK allow",
-                "cmd appops get %s WAKE_LOCK", "allow",
-            ),
-            Step(
-                // Mở data nền (bỏ hạn chế background-data) qua uid của app.
-                "$UID_OF; [ -n \"\$uid\" ] && cmd netpolicy add restrict-background-whitelist \"\$uid\"",
-                "$UID_OF; cmd netpolicy list restrict-background-whitelist | grep -qw \"\$uid\" && echo OK || echo NO",
-                "OK",
-            ),
-        ),
-        revert = listOf(
-            "dumpsys deviceidle whitelist -%s",
-            "am set-standby-bucket %s working_set",
-            "cmd appops set %s RUN_ANY_IN_BACKGROUND default",
-            "cmd appops set %s RUN_IN_BACKGROUND default",
-            "cmd appops set %s WAKE_LOCK default",
-            "$UID_OF; [ -n \"\$uid\" ] && cmd netpolicy remove restrict-background-whitelist \"\$uid\"",
-        ),
-    )
-
-    /** Build the real steps for a per-app push tweak against one package. */
-    fun stepsFor(pkg: String): List<Step> = perApp.steps.map {
-        Step(
-            apply = it.apply.replace("%s", pkg),
-            verify = it.verify?.replace("%s", pkg),
-            expect = it.expect?.replace("%s", pkg),
-        )
-    }
-
-    /** Commands that switch the per-app setup off again for one package. */
-    fun revertFor(pkg: String): List<String> = perApp.revert.map { it.replace("%s", pkg) }
+    private fun explicitAllow(pkg: String, op: String) = listOf(
+        "q=\$(cmd appops query-op $op allow 2>&1)",
+        "case \"\$q\" in",
+        // Match only error text, not package names ("*sage*" would hit com.android.messages).
+        "  Error:*|*nknown\\ command*|*nknown\\ op*) cmd appops get $pkg $op 2>/dev/null | grep -q allow && echo OK || echo NO ;;",
+        "  *) echo \"\$q\" | grep -qx '$pkg' && echo OK || echo NO ;;",
+        "esac",
+    ).joinToString("\n")
 
     // MIUI-only app-op probe: allow → OK, ignore/deny/unset → NO, unknown op (non-MIUI) → NA.
     private fun miuiOpProbe(op: Int) = listOf(
@@ -210,8 +156,10 @@ object TweakCatalog {
 
     private const val SPACE = " "
 
+    // `pm list packages -U` first; dumpsys fallback. Android 16 renamed dumpsys "userId=" to "appId=".
     private const val UID_OF =
-        "uid=\$(dumpsys package '%s' | sed -n 's/.*userId=\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)"
+        "uid=\$(cmd package list packages -U '%s' 2>/dev/null | sed -n 's/^package:%s uid:\\([0-9][0-9]*\\).*/\\1/p' | head -n 1); " +
+            "[ -n \"\$uid\" ] || uid=\$(dumpsys package '%s' | sed -n -e 's/.*userId=\\([0-9][0-9]*\\).*/\\1/p' -e 's/.*appId=\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)"
 
     /**
      * Per-app health checks: read-only probes that tell whether each setting needed for
@@ -305,12 +253,14 @@ object TweakCatalog {
             title = Txt("Mở cửa sổ khi chạy nền (MIUI)", "Open windows from background (MIUI)"),
             probe = miuiOpProbe(10021),
             fix = "cmd appops set %s 10021 allow",
+            optional = true,
         ),
         AppCheck(
             id = "lockscreen",
             title = Txt("Hiện trên màn khóa (MIUI)", "Show on lock screen (MIUI)"),
             probe = miuiOpProbe(10020),
             fix = "cmd appops set %s 10020 allow",
+            optional = true,
         ),
     )
 
@@ -341,6 +291,9 @@ object TweakCatalog {
         }
     }
 
+    /** ids of [appChecks] that count toward the score and FIX (everything except optional ones). */
+    val scoredChecks: Set<String> = appChecks.filter { !it.optional }.map { it.id }.toSet()
+
     /** Display text for a [CheckResult.detail] key, in the current language. */
     fun detailText(detail: String): String = DETAILS[detail]?.text ?: detail
 
@@ -348,6 +301,7 @@ object TweakCatalog {
     private val DETAILS = mapOf(
         "unsupported" to Txt("ROM không hỗ trợ", "not supported by ROM"),
         "unreadable" to Txt("không đọc được", "unreadable"),
+        "needs_shizuku" to Txt("cần Shizuku để đọc", "needs Shizuku to read"),
         "default_off" to Txt("mặc định (tắt)", "default (off)"),
         "blocked" to Txt("bị chặn", "blocked"),
         "notif_off" to Txt("thông báo đang bị tắt", "notifications are off"),

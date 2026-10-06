@@ -10,7 +10,8 @@ import java.io.InputStreamReader
 class UserService : IUserService.Stub() {
 
     override fun destroy() {
-        // Nothing to clean up; let the process be killed.
+        // Shizuku does not kill the process for us: without this every app restart leaked one.
+        System.exit(0)
     }
 
     override fun exec(command: String): String {

@@ -18,16 +18,23 @@ loses its FCM connection and push notifications arrive late or not at all.
 - **System tweaks** (Shizuku): disable App Freezer, Doze, adaptive battery and App Standby, allow
   wakelocks for GMS, and more. Each tweak has an on/off switch that reflects the real device state,
   a one-line description and a battery impact tag. Turning a tweak off restores the ROM default.
-- **Per-app checks**: notification permission, Autostart, background run, battery optimization,
-  standby bucket, background data… with one-tap fixes and shortcuts to the matching settings page.
+- **No-restrict list editor**: view `MILLET_NO_RESTRICT_APP` and add or remove apps (no Shizuku
+  needed). GMS stays pinned.
+- **App check**: one line per app (issues first) covering notification permission, Autostart,
+  background run, battery optimization (Doze whitelist), standby bucket, background data and more.
+  Fixes and shortcuts to the matching settings page are one tap away. Works partly without Shizuku.
+  Pop-up and lock-screen permissions are marked optional (only needed for incoming-call screens).
 - **Debloat**: remove known Chinese bloatware for the current user, with restore.
-- Every change is verified by reading the value back from the device.
+- Every change is verified by reading the value back from the device. Without Shizuku, tweak states
+  that are plain settings are still shown (read-only).
+- First-run setup screen that grants each permission from its system settings page.
 - Monochrome UI inspired by Nothing OS, in English or Vietnamese (VI | EN switch in the top bar).
 
 ## Requirements
 
 - Xiaomi / Redmi / POCO phone on HyperOS (China ROM), Android 8.0+.
-- Shizuku for everything except FCM Guard.
+- Shizuku for tweaks and fixes. FCM Guard, the no-restrict list editor and part of the app check
+  work without it.
 
 The app targets **SDK 22** on purpose: legacy target apps get `WRITE_SETTINGS` on install and can write
 the non-public vendor key without root. Do not raise `targetSdk`. Xiaomi China ROMs install it

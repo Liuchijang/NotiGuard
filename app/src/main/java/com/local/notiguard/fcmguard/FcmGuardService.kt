@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import com.local.notiguard.MainActivity
+import com.local.notiguard.Permissions
 import com.local.notiguard.fcmcore.FcmList
 import com.local.notiguard.shizuku.ShizukuManager
 import com.local.notiguard.tr
@@ -88,7 +89,9 @@ class FcmGuardService : Service() {
 
     @Suppress("DEPRECATION")
     private fun applyExecutionMode() {
-        if (FcmGuard.prefs(this).persistentNotification) {
+        // Quiet until notifications were allowed from Settings: creating the channel earlier makes
+        // Android 13+ show its prompt, and granting there kills this legacy-target app.
+        if (FcmGuard.prefs(this).persistentNotification && notificationsReady(this)) {
             ensureChannel(this)
             startForeground(NOTIFICATION_ID, build(tr("Đang theo dõi danh sách không hạn chế", "Watching the no-restrict list")))
             foreground = true
@@ -114,7 +117,9 @@ class FcmGuardService : Service() {
 
     private fun build(text: String): Notification {
         val pi = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
+            this, 0,
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         return Notification.Builder(this, CHANNEL_ID)
@@ -148,8 +153,12 @@ class FcmGuardService : Service() {
             context.stopService(Intent(context, FcmGuardService::class.java))
         }
 
+        /** Persistent mode may create its channel now (see [Permissions.notificationsReady]). */
+        fun notificationsReady(context: Context) = Permissions.notificationsReady(context, CHANNEL_ID)
+
         /** True when Android will actually show the foreground notification in the shade. */
         fun canShowNotification(context: Context): Boolean {
+            if (!notificationsReady(context)) return false
             val nm = context.getSystemService(NotificationManager::class.java) ?: return false
             if (!nm.areNotificationsEnabled()) return false
             val channel = nm.getNotificationChannel(CHANNEL_ID) ?: return true

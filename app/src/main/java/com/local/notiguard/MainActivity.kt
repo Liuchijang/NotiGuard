@@ -7,6 +7,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import com.local.notiguard.shizuku.ShizukuManager
 import com.local.notiguard.ui.MainScreen
+import com.local.notiguard.ui.SetupScreen
 import com.local.notiguard.ui.theme.NotiGuardTheme
 
 class MainActivity : ComponentActivity() {
@@ -18,7 +19,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             NotiGuardTheme {
-                MainScreen(model)
+                // First run: own-styled permission setup instead of system prompts over the app.
+                if (model.showSetup) SetupScreen(model) else MainScreen(model)
             }
         }
     }

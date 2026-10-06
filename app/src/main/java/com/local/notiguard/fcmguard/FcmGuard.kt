@@ -39,13 +39,7 @@ object FcmGuard {
             return RepairResult(true, false, current, tr("GMS đã có trong danh sách", "GMS is already in the list"))
         }
 
-        var how = tr("trực tiếp", "direct")
-        var error = writeDirect(context, target)
-        if (error != null && ShizukuManager.state.value == ShizukuManager.State.READY) {
-            val w = ShizukuManager.exec("settings put system ${FcmList.KEY} ${FcmList.shellQuote(target)}")
-            how = tr("qua Shizuku", "via Shizuku")
-            error = if (w.ok) null else "[${w.exitCode}] ${w.output.trim()}"
-        }
+        val (how, error) = write(context, target)
         val after = read(context)
         if (error != null || !FcmList.hasGms(after)) {
             return RepairResult(false, false, after, tr("Ghi thất bại", "Write failed") + " — ${error ?: tr("đọc lại không thấy GMS", "GMS missing on read-back")}")
@@ -53,6 +47,37 @@ object FcmGuard {
         prefs.remember(after)
         FcmList.reconnect(context)
         RepairResult(true, true, after, tr("Đã thêm lại GMS ($how) + kích kết nối FCM", "Re-added GMS ($how) + FCM reconnect sent"))
+    }
+
+    /** Adds [pkg] to the list (user's choice from the app UI); every other entry is kept. */
+    suspend fun add(context: Context, pkg: String): RepairResult =
+        edit(context) { current, lastGood -> FcmList.withAdded(current, lastGood, pkg) }
+
+    /** Removes [pkg] from the list; GMS cannot be removed while FCM Guard owns it. */
+    suspend fun remove(context: Context, pkg: String): RepairResult =
+        edit(context) { current, _ -> FcmList.withRemoved(current, pkg) }
+
+    /** One user edit under the same lock as [repair], written and read back like a repair. */
+    private suspend fun edit(context: Context, change: (String?, String?) -> String?): RepairResult = repairLock.withLock {
+        val prefs = prefs(context)
+        val current = read(context)
+        val target = change(current, prefs.lastGood)
+            ?: return RepairResult(true, false, current, tr("Không có gì thay đổi", "Nothing to change"))
+        val (how, error) = write(context, target)
+        val after = read(context)
+        if (error != null || FcmList.parse(after) != FcmList.parse(target)) {
+            return RepairResult(false, false, after, tr("Ghi thất bại", "Write failed") + " — ${error ?: tr("đọc lại không khớp", "read-back mismatch")}")
+        }
+        prefs.remember(after)
+        RepairResult(true, true, after, tr("Đã ghi", "Written") + " ($how)")
+    }
+
+    /** Direct write first, then `settings put` through Shizuku. Returns (how, error or null). */
+    private suspend fun write(context: Context, value: String): Pair<String, String?> {
+        val error = writeDirect(context, value)
+        if (error == null || ShizukuManager.state.value != ShizukuManager.State.READY) return tr("trực tiếp", "direct") to error
+        val w = ShizukuManager.exec("settings put system ${FcmList.KEY} ${FcmList.shellQuote(value)}")
+        return tr("qua Shizuku", "via Shizuku") to (if (w.ok) null else "[${w.exitCode}] ${w.output.trim()}")
     }
 
     /** Returns null on success, otherwise why the direct write failed. */
