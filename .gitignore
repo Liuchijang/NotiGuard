@@ -1,0 +1,28 @@
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+build/
+local.properties
+
+# IDE
+*.iml
+.idea/
+.vscode/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Build output & signing material
+*.apk
+*.aab
+*.idsig
+*.keystore
+*.jks
+
+# Local notes (Claude Code project memory, has machine-specific paths)
+CLAUDE.md
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
