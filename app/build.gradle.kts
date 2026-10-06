@@ -1,7 +1,16 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// Release signing comes from local.properties (never committed):
+//   release.storeFile / release.storePassword / release.keyAlias / release.keyPassword
+// Without them the release build is produced unsigned.
+val localProps = Properties().apply {
+    rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
 }
 
 android {
@@ -18,8 +27,8 @@ android {
         // Xiaomi's China ROM installs it directly.
         @Suppress("ExpiredTargetSdkVersion")
         targetSdk = 22
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "2.1"
     }
 
     lint {
@@ -27,14 +36,34 @@ android {
         checkReleaseBuilds = false
     }
 
+    signingConfigs {
+        localProps.getProperty("release.storeFile")?.let { path ->
+            create("release") {
+                storeFile = file(path)
+                storePassword = localProps.getProperty("release.storePassword")
+                keyAlias = localProps.getProperty("release.keyAlias")
+                keyPassword = localProps.getProperty("release.keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            vcsInfo.include = false
+            signingConfig = signingConfigs.findByName("release")
+            // No R8: Shizuku binds the UserService by class name, and the APK is small anyway.
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
         }
+    }
+
+    // Keep build-machine details out of the APK: no VCS info file, no dependency metadata block.
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
 
     compileOptions {
